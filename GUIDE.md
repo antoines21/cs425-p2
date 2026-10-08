@@ -37,7 +37,7 @@ The protocol is **Go-Back-N**, as described in section 3.4 of the textbook and i
 
 You write one program with two modes. The **receiver** registers with the relay and writes what it receives to a file. The **sender** registers with the relay and sends a file. The relay pairs them up and forwards traffic in both directions, damaging it along the way at the rates the sender asked for.
 
-![The P2 setup: sender, relay and receiver](https://boisestatecanvas.instructure.com/courses/48194/files/25207224/preview)
+![The P2 setup: sender, relay and receiver](p2-setup.svg)
 
 ```
 ----------------------------------------------------------------
@@ -92,7 +92,7 @@ Notes:
 
 The whole sender is two numbers and the packets between them. `base` is the oldest packet not yet acknowledged, and `next` is the next packet never sent. Everything below `base` is finished. Everything from `base` up to `next - 1` is in flight, so the sender keeps a copy in case it has to resend it. The sender may keep sending until `next` reaches `base + N`, and then it has to wait for an ACK to move `base`.
 
-![The sender's window over the packet numbers](https://boisestatecanvas.instructure.com/courses/48194/files/25206887/preview)
+![The sender's window over the packet numbers](p2-window.svg)
 
 ````
 ----------------------------------------------------------------
@@ -141,7 +141,7 @@ Every rule in Task 3 is a statement about how `base` and `next` move. An ACK mov
 
 This is one complete exchange with a window of 4 and six DATA packets, where the relay drops DATA 2. Read it top to bottom, one arrow at a time.
 
-![Go-Back-N timeline with DATA 2 lost](https://boisestatecanvas.instructure.com/courses/48194/files/25206889/preview)
+![Go-Back-N timeline with DATA 2 lost](p2-gbn-timeline.svg)
 
 ````
 ----------------------------------------------------------------
@@ -238,7 +238,7 @@ Three things in it are the whole protocol:
 
 ## The relay
 
-The relay is a small program you run yourself, on the same machine as your sender and receiver. Download **[cs425_relay.py](https://boisestatecanvas.instructure.com/courses/48194/files/25324577)**. It is a single Python file that needs nothing but `python3`, which Onyx, Codespaces, macOS and Linux all have. Run it in one terminal, then your receiver and your sender in two more, all pointed at `127.0.0.1`:
+The relay is a small program you run yourself, on the same machine as your sender and receiver. Download **[cs425_relay.py](cs425_relay.py)**. It is a single Python file that needs nothing but `python3`, which Onyx, Codespaces, macOS and Linux all have. Run it in one terminal, then your receiver and your sender in two more, all pointed at `127.0.0.1`:
 
 ```bash
 python3 cs425_relay.py --delay 50
