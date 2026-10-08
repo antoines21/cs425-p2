@@ -118,6 +118,40 @@ static int register_receiver(int socket_fd, const char *session)
     return -1;
 }
 
+static int register_sender(int socket_fd, const char *session, double loss,
+                           double corrupt, double duplicate)
+{
+    char hello[128];
+    char response[128];
+    int attempt;
+
+    if (snprintf(hello, sizeof(hello), "HELLO %s send %g %g %g", session,
+                 loss, corrupt, duplicate) < 0) {
+        return -1;
+    }
+    for (attempt = 0; attempt < 5; ++attempt) {
+        size_t hello_length = strlen(hello);
+        ssize_t sent = send(socket_fd, hello, hello_length, 0);
+        if (sent < 0 || (size_t)sent != hello_length) {
+            return -1;
+        }
+        if (wait_for_socket(socket_fd, 1000) > 0) {
+            ssize_t received = recv(socket_fd, response, sizeof(response) - 1, 0);
+            if (received < 0) {
+                return -1;
+            }
+            response[received] = '\0';
+            if (strcmp(response, "OK") == 0) {
+                return 0;
+            }
+            fprintf(stderr, "relay refused sender: %s\n", response);
+            return -1;
+        }
+    }
+    fprintf(stderr, "relay did not answer sender registration\n");
+    return -1;
+}
+
 static int send_ack(int socket_fd, uint32_t sequence)
 {
     struct packet ack = {.type = PACKET_ACK, .seq = sequence, .length = 0};
@@ -129,6 +163,190 @@ static int send_ack(int socket_fd, uint32_t sequence)
         return -1;
     }
     return 0;
+}
+
+static int send_packet(int socket_fd, const struct packet *packet)
+{
+    uint8_t wire[PACKET_HEADER_SIZE + PACKET_MAX_PAYLOAD];
+    size_t wire_length;
+
+    if (packet_encode(packet, wire, sizeof(wire), &wire_length) != 0 ||
+        send(socket_fd, wire, wire_length, 0) != (ssize_t)wire_length) {
+        return -1;
+    }
+    return 0;
+}
+
+static int send_file(int socket_fd, const char *file_name, long window_size,
+                     long timeout_ms)
+{
+    FILE *input = fopen(file_name, "rb");
+    struct packet outstanding[64] = {0};
+    uint8_t wire[PACKET_HEADER_SIZE + PACKET_MAX_PAYLOAD];
+    struct packet incoming;
+    uint32_t base = 0;
+    uint32_t next = 0;
+    uint32_t sent_through = 0;
+    int eof = 0;
+    int fin_sent = 0;
+    int consecutive_timeouts = 0;
+    int64_t timer_due = -1;
+    int result = 2;
+
+    if (input == NULL) {
+        fprintf(stderr, "could not open input file %s: %s\n", file_name,
+                strerror(errno));
+        return 2;
+    }
+    for (;;) {
+        int64_t now;
+
+        while (!eof && next - base < (uint32_t)window_size) {
+            struct packet *packet = &outstanding[next % (uint32_t)window_size];
+            size_t bytes_read = fread(packet->payload, 1, PACKET_MAX_PAYLOAD,
+                                      input);
+
+            if (bytes_read == 0) {
+                if (ferror(input) != 0) {
+                    fprintf(stderr, "could not read input file %s: %s\n",
+                            file_name, strerror(errno));
+                    goto done;
+                }
+                eof = 1;
+                break;
+            }
+            packet->type = PACKET_DATA;
+            packet->seq = next;
+            packet->length = (uint16_t)bytes_read;
+            ++next;
+        }
+
+        if (eof && !fin_sent && base == next) {
+            struct packet *fin = &outstanding[next % (uint32_t)window_size];
+            fin->type = PACKET_FIN;
+            fin->seq = next;
+            fin->length = 0;
+            ++next;
+            fin_sent = 1;
+        }
+
+        now = monotonic_milliseconds();
+        if (now < 0) {
+            fprintf(stderr, "could not read monotonic clock\n");
+            goto done;
+        }
+        if (base < next && timer_due < 0) {
+            timer_due = now + timeout_ms;
+        }
+
+        if (sent_through < next) {
+            uint32_t sequence;
+
+            for (sequence = sent_through; sequence < next; ++sequence) {
+                if (send_packet(socket_fd,
+                                &outstanding[sequence %
+                                             (uint32_t)window_size]) != 0) {
+                    fprintf(stderr, "sender failed to send packet: %s\n",
+                            strerror(errno));
+                    goto done;
+                }
+            }
+            sent_through = next;
+            if (timer_due < 0) {
+                timer_due = now + timeout_ms;
+            }
+        }
+
+        if (fin_sent && base == next) {
+            result = 0;
+            break;
+        }
+        if (base == next && eof) {
+            continue;
+        }
+
+        now = monotonic_milliseconds();
+        if (now < 0) {
+            fprintf(stderr, "could not read monotonic clock\n");
+            goto done;
+        }
+        if (timer_due <= now) {
+            ++consecutive_timeouts;
+            if (consecutive_timeouts >= 10) {
+                fprintf(stderr, "sender gave up after 10 timeouts\n");
+                goto done;
+            }
+            {
+                uint32_t sequence;
+
+                for (sequence = base; sequence < next; ++sequence) {
+                    if (send_packet(
+                            socket_fd,
+                            &outstanding[sequence %
+                                         (uint32_t)window_size]) != 0) {
+                        fprintf(stderr, "sender failed to retransmit packet: %s\n",
+                                strerror(errno));
+                        goto done;
+                    }
+                }
+                sent_through = next;
+            }
+            timer_due = now + timeout_ms;
+            continue;
+        }
+
+        {
+            int64_t remaining = timer_due - now;
+            int ready = wait_for_socket(
+                socket_fd, remaining > INT_MAX ? INT_MAX : (int)remaining);
+
+            if (ready < 0) {
+                fprintf(stderr, "sender failed while waiting: %s\n",
+                        strerror(errno));
+                goto done;
+            }
+            if (ready == 0) {
+                continue;
+            }
+        }
+
+        {
+            ssize_t received = recv(socket_fd, wire, sizeof(wire), 0);
+            if (received < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                fprintf(stderr, "sender failed to receive ACK: %s\n",
+                        strerror(errno));
+                goto done;
+            }
+            if (packet_decode(wire, (size_t)received, &incoming) != 0 ||
+                incoming.type != PACKET_ACK || incoming.length != 0 ||
+                incoming.seq <= base || incoming.seq > next) {
+                continue;
+            }
+            base = incoming.seq;
+            consecutive_timeouts = 0;
+            if (base < next) {
+                int64_t ack_time = monotonic_milliseconds();
+                if (ack_time < 0) {
+                    fprintf(stderr, "could not read monotonic clock\n");
+                    goto done;
+                }
+                timer_due = ack_time + timeout_ms;
+            } else {
+                timer_due = -1;
+            }
+        }
+    }
+
+done:
+    if (fclose(input) != 0 && result == 0) {
+        fprintf(stderr, "could not close input file %s: %s\n", file_name,
+                strerror(errno));
+        result = 2;
+    }
+    return result;
 }
 
 static int receive_file(int socket_fd, const char *file_name)
@@ -388,12 +606,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "could not resolve relay: %s\n", relay);
         return 2;
     }
-    if (strcmp(mode, "send") == 0) {
-        freeaddrinfo(relay_address);
-        fprintf(stderr, "transfer is not implemented yet\n");
-        return 2;
-    }
-
     for (address = relay_address; address != NULL; address = address->ai_next) {
         socket_fd = socket(address->ai_family, address->ai_socktype,
                            address->ai_protocol);
@@ -411,9 +623,16 @@ int main(int argc, char **argv)
         freeaddrinfo(relay_address);
         return 2;
     }
-    result = register_receiver(socket_fd, session);
-    if (result == 0) {
-        result = receive_file(socket_fd, file);
+    if (strcmp(mode, "send") == 0) {
+        result = register_sender(socket_fd, session, loss, corrupt, duplicate);
+        if (result == 0) {
+            result = send_file(socket_fd, file, window, timeout_ms);
+        }
+    } else {
+        result = register_receiver(socket_fd, session);
+        if (result == 0) {
+            result = receive_file(socket_fd, file);
+        }
     }
     close(socket_fd);
     freeaddrinfo(relay_address);

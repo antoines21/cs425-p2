@@ -33,7 +33,8 @@ int packet_encode(const struct packet *packet, uint8_t *buffer,
     uint16_t payload_length;
 
     if (packet == NULL || buffer == NULL || encoded_length == NULL ||
-        packet->type > PACKET_FIN || packet->length > PACKET_MAX_PAYLOAD) {
+        packet->type > PACKET_FIN || packet->length > PACKET_MAX_PAYLOAD ||
+        (packet->type != PACKET_DATA && packet->length != 0)) {
         return -1;
     }
     length = PACKET_HEADER_SIZE + packet->length;
@@ -66,6 +67,7 @@ int packet_decode(const uint8_t *buffer, size_t length, struct packet *packet)
     memcpy(&payload_length, buffer + 8, sizeof(payload_length));
     payload_length = ntohs(payload_length);
     if (payload_length > PACKET_MAX_PAYLOAD ||
+        (buffer[0] != PACKET_DATA && payload_length != 0) ||
         (size_t)PACKET_HEADER_SIZE + payload_length != length) {
         return -1;
     }
