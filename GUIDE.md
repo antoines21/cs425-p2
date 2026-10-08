@@ -304,7 +304,7 @@ Every datagram you send through the relay after registering is one packet, laid 
 
 The header is 10 bytes, so the largest packet is 1034 bytes.
 
-**Checksum.** Use the Internet checksum from [RFC 1071](https://www.rfc-editor.org/rfc/rfc1071): the 16-bit one's complement of the one's complement sum of the packet taken as 16-bit words, computed with the `checksum` field set to zero. Pad an odd length with one zero byte for the calculation only. The RFC's worked example is a good first unit test: the bytes `00 01 f2 03 f4 f5 f6 f7` sum to `0xddf2`, so their checksum is `0x220d`.
+**Checksum.** Use the Internet checksum from [RFC 1071](rfc1071.txt): the 16-bit one's complement of the one's complement sum of the packet taken as 16-bit words, computed with the `checksum` field set to zero. Pad an odd length with one zero byte for the calculation only. The RFC's worked example is a good first unit test: the bytes `00 01 f2 03 f4 f5 f6 f7` sum to `0xddf2`, so their checksum is `0x220d`.
 
 **Sequence numbers** count packets, not bytes.
 
