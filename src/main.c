@@ -152,19 +152,6 @@ static int register_sender(int socket_fd, const char *session, double loss,
     return -1;
 }
 
-static int send_ack(int socket_fd, uint32_t sequence)
-{
-    struct packet ack = {.type = PACKET_ACK, .seq = sequence, .length = 0};
-    uint8_t wire[PACKET_HEADER_SIZE];
-    size_t wire_length;
-
-    if (packet_encode(&ack, wire, sizeof(wire), &wire_length) != 0 ||
-        send(socket_fd, wire, wire_length, 0) != (ssize_t)wire_length) {
-        return -1;
-    }
-    return 0;
-}
-
 static int send_packet(int socket_fd, const struct packet *packet)
 {
     uint8_t wire[PACKET_HEADER_SIZE + PACKET_MAX_PAYLOAD];
@@ -181,16 +168,11 @@ static int send_file(int socket_fd, const char *file_name, long window_size,
                      long timeout_ms)
 {
     FILE *input = fopen(file_name, "rb");
-    struct packet outstanding[64] = {0};
     uint8_t wire[PACKET_HEADER_SIZE + PACKET_MAX_PAYLOAD];
     struct packet incoming;
-    uint32_t base = 0;
-    uint32_t next = 0;
-    uint32_t sent_through = 0;
-    int eof = 0;
-    int fin_sent = 0;
-    int consecutive_timeouts = 0;
-    int64_t timer_due = -1;
+    struct sender_state sender;
+    struct protocol_actions actions;
+    uint8_t chunk[PACKET_MAX_PAYLOAD];
     int result = 2;
 
     if (input == NULL) {
@@ -198,108 +180,75 @@ static int send_file(int socket_fd, const char *file_name, long window_size,
                 strerror(errno));
         return 2;
     }
+    sender_init(&sender, (uint32_t)window_size, timeout_ms);
     for (;;) {
-        int64_t now;
-
-        while (!eof && next - base < (uint32_t)window_size) {
-            struct packet *packet = &outstanding[next % (uint32_t)window_size];
-            size_t bytes_read = fread(packet->payload, 1, PACKET_MAX_PAYLOAD,
-                                      input);
-
+        int64_t now = monotonic_milliseconds();
+        if (now < 0) {
+            fprintf(stderr, "could not read monotonic clock\n");
+            goto done;
+        }
+        while (!sender.input_finished && sender_capacity(&sender) > 0) {
+            size_t bytes_read = fread(chunk, 1, sizeof(chunk), input);
             if (bytes_read == 0) {
                 if (ferror(input) != 0) {
                     fprintf(stderr, "could not read input file %s: %s\n",
                             file_name, strerror(errno));
                     goto done;
                 }
-                eof = 1;
+                if (sender_finish(&sender, now, &actions) != 0) {
+                    goto done;
+                }
                 break;
             }
-            packet->type = PACKET_DATA;
-            packet->seq = next;
-            packet->length = (uint16_t)bytes_read;
-            ++next;
-        }
-
-        if (eof && !fin_sent && base == next) {
-            struct packet *fin = &outstanding[next % (uint32_t)window_size];
-            fin->type = PACKET_FIN;
-            fin->seq = next;
-            fin->length = 0;
-            ++next;
-            fin_sent = 1;
-        }
-
-        now = monotonic_milliseconds();
-        if (now < 0) {
-            fprintf(stderr, "could not read monotonic clock\n");
-            goto done;
-        }
-        if (base < next && timer_due < 0) {
-            timer_due = now + timeout_ms;
-        }
-
-        if (sent_through < next) {
-            uint32_t sequence;
-
-            for (sequence = sent_through; sequence < next; ++sequence) {
-                if (send_packet(socket_fd,
-                                &outstanding[sequence %
-                                             (uint32_t)window_size]) != 0) {
+            if (sender_push_data(&sender, chunk, (uint16_t)bytes_read, now,
+                                 &actions) != 0) {
+                goto done;
+            }
+            for (size_t i = 0; i < actions.outgoing_count; ++i) {
+                if (send_packet(socket_fd, &actions.outgoing[i]) != 0) {
                     fprintf(stderr, "sender failed to send packet: %s\n",
                             strerror(errno));
                     goto done;
                 }
             }
-            sent_through = next;
-            if (timer_due < 0) {
-                timer_due = now + timeout_ms;
+        }
+        if (sender.input_finished && sender.base == sender.next &&
+            !sender.fin_sent) {
+            if (sender_finish(&sender, now, &actions) != 0) {
+                goto done;
             }
         }
-
-        if (fin_sent && base == next) {
+        if (sender_is_complete(&sender)) {
             result = 0;
             break;
         }
-        if (base == next && eof) {
+        if (sender.timer_due < 0) {
             continue;
         }
-
         now = monotonic_milliseconds();
         if (now < 0) {
             fprintf(stderr, "could not read monotonic clock\n");
             goto done;
         }
-        if (timer_due <= now) {
-            ++consecutive_timeouts;
-            if (consecutive_timeouts >= 10) {
+        if (sender.timer_due <= now) {
+            int timeout_result = sender_on_timeout(&sender, now, &actions);
+            if (timeout_result != 0) {
                 fprintf(stderr, "sender gave up after 10 timeouts\n");
                 goto done;
             }
-            {
-                uint32_t sequence;
-
-                for (sequence = base; sequence < next; ++sequence) {
-                    if (send_packet(
-                            socket_fd,
-                            &outstanding[sequence %
-                                         (uint32_t)window_size]) != 0) {
-                        fprintf(stderr, "sender failed to retransmit packet: %s\n",
-                                strerror(errno));
-                        goto done;
-                    }
+            for (size_t i = 0; i < actions.outgoing_count; ++i) {
+                if (send_packet(socket_fd, &actions.outgoing[i]) != 0) {
+                    fprintf(stderr, "sender failed to retransmit packet: %s\n",
+                            strerror(errno));
+                    goto done;
                 }
-                sent_through = next;
             }
-            timer_due = now + timeout_ms;
             continue;
         }
-
         {
-            int64_t remaining = timer_due - now;
+            int64_t remaining = sender.timer_due - now;
             int ready = wait_for_socket(
                 socket_fd, remaining > INT_MAX ? INT_MAX : (int)remaining);
-
             if (ready < 0) {
                 fprintf(stderr, "sender failed while waiting: %s\n",
                         strerror(errno));
@@ -309,7 +258,6 @@ static int send_file(int socket_fd, const char *file_name, long window_size,
                 continue;
             }
         }
-
         {
             ssize_t received = recv(socket_fd, wire, sizeof(wire), 0);
             if (received < 0) {
@@ -321,21 +269,21 @@ static int send_file(int socket_fd, const char *file_name, long window_size,
                 goto done;
             }
             if (packet_decode(wire, (size_t)received, &incoming) != 0 ||
-                incoming.type != PACKET_ACK || incoming.length != 0 ||
-                incoming.seq <= base || incoming.seq > next) {
+                incoming.type != PACKET_ACK || incoming.length != 0) {
                 continue;
             }
-            base = incoming.seq;
-            consecutive_timeouts = 0;
-            if (base < next) {
-                int64_t ack_time = monotonic_milliseconds();
-                if (ack_time < 0) {
-                    fprintf(stderr, "could not read monotonic clock\n");
+            now = monotonic_milliseconds();
+            if (now < 0) {
+                fprintf(stderr, "could not read monotonic clock\n");
+                goto done;
+            }
+            sender_on_ack(&sender, incoming.seq, now, &actions);
+            for (size_t i = 0; i < actions.outgoing_count; ++i) {
+                if (send_packet(socket_fd, &actions.outgoing[i]) != 0) {
+                    fprintf(stderr, "sender failed to send packet: %s\n",
+                            strerror(errno));
                     goto done;
                 }
-                timer_due = ack_time + timeout_ms;
-            } else {
-                timer_due = -1;
             }
         }
     }
@@ -354,7 +302,8 @@ static int receive_file(int socket_fd, const char *file_name)
     FILE *output = fopen(file_name, "wb");
     uint8_t wire[PACKET_HEADER_SIZE + PACKET_MAX_PAYLOAD];
     struct packet packet;
-    uint32_t expected = 0;
+    struct receiver_state receiver;
+    struct protocol_actions actions;
     int64_t last_valid;
     int result = 2;
 
@@ -363,6 +312,7 @@ static int receive_file(int socket_fd, const char *file_name)
                 strerror(errno));
         return 2;
     }
+    receiver_init(&receiver);
     last_valid = monotonic_milliseconds();
     if (last_valid < 0) {
         fprintf(stderr, "could not read monotonic clock\n");
@@ -379,9 +329,21 @@ static int receive_file(int socket_fd, const char *file_name)
             fprintf(stderr, "could not read monotonic clock\n");
             break;
         }
-        timeout_ms = (int)(30000 - (now - last_valid));
+        if (receiver_linger_expired(&receiver, now)) {
+            result = 0;
+            break;
+        }
+        if (receiver_is_finished(&receiver)) {
+            timeout_ms = (int)(receiver.linger_until - now);
+        } else {
+            timeout_ms = (int)(30000 - (now - last_valid));
+        }
         if (timeout_ms <= 0) {
-            fprintf(stderr, "receiver timed out waiting for a valid packet\n");
+            if (receiver_is_finished(&receiver)) {
+                result = 0;
+            } else {
+                fprintf(stderr, "receiver timed out waiting for a valid packet\n");
+            }
             break;
         }
         ready = wait_for_socket(socket_fd, timeout_ms);
@@ -406,88 +368,28 @@ static int receive_file(int socket_fd, const char *file_name)
             fprintf(stderr, "could not read monotonic clock\n");
             break;
         }
-        if (packet.type == PACKET_DATA) {
-            if (packet.seq == expected) {
-                if (fwrite(packet.payload, 1, packet.length, output) !=
-                    packet.length) {
-                    fprintf(stderr, "could not write output file %s: %s\n",
-                            file_name, strerror(errno));
-                    break;
-                }
-                ++expected;
-            }
-            if (send_ack(socket_fd, expected) != 0) {
+        receiver_on_packet(&receiver, &packet, last_valid, &actions);
+        if (actions.delivered_packet &&
+            fwrite(actions.delivered, 1, actions.delivered_length, output) !=
+                actions.delivered_length) {
+            fprintf(stderr, "could not write output file %s: %s\n",
+                    file_name, strerror(errno));
+            break;
+        }
+        for (size_t i = 0; i < actions.outgoing_count; ++i) {
+            if (send_packet(socket_fd, &actions.outgoing[i]) != 0) {
                 fprintf(stderr, "receiver failed to send ACK: %s\n",
                         strerror(errno));
                 break;
             }
-        } else if (packet.type == PACKET_FIN) {
-            if (packet.seq != expected) {
-                if (send_ack(socket_fd, expected) != 0) {
-                    fprintf(stderr, "receiver failed to send ACK: %s\n",
-                            strerror(errno));
-                    break;
-                }
-                continue;
-            }
-            ++expected;
+        }
+        if (receiver_is_finished(&receiver)) {
             if (fclose(output) != 0) {
                 fprintf(stderr, "could not close output file %s: %s\n",
                         file_name, strerror(errno));
                 return 2;
             }
             output = NULL;
-            if (send_ack(socket_fd, expected) != 0) {
-                fprintf(stderr, "receiver failed to send final ACK: %s\n",
-                        strerror(errno));
-                return 2;
-            }
-            {
-                int64_t linger_until = monotonic_milliseconds();
-                if (linger_until < 0) {
-                    fprintf(stderr, "could not read monotonic clock\n");
-                    return 2;
-                }
-                linger_until += 2000;
-                for (;;) {
-                    int64_t remaining = linger_until - monotonic_milliseconds();
-                    int ready;
-
-                    if (remaining <= 0) {
-                        result = 0;
-                        break;
-                    }
-                    ready = wait_for_socket(
-                        socket_fd, remaining > INT_MAX ? INT_MAX : (int)remaining);
-                    if (ready < 0) {
-                        fprintf(stderr, "receiver failed during linger: %s\n",
-                                strerror(errno));
-                        return 2;
-                    }
-                    if (ready == 0) {
-                        result = 0;
-                        break;
-                    }
-                    received = recv(socket_fd, wire, sizeof(wire), 0);
-                    if (received < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        fprintf(stderr, "receiver failed during linger: %s\n",
-                                strerror(errno));
-                        return 2;
-                    }
-                    if (packet_decode(wire, (size_t)received, &packet) == 0 &&
-                        packet.type == PACKET_FIN &&
-                        packet.seq == expected - 1U &&
-                        send_ack(socket_fd, expected) != 0) {
-                        fprintf(stderr, "receiver failed to resend final ACK: %s\n",
-                                strerror(errno));
-                        return 2;
-                    }
-                }
-            }
-            break;
         }
     }
     if (output != NULL) {

@@ -5,6 +5,214 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+static void sender_update_timer(struct sender_state *sender, int64_t now)
+{
+    sender->timer_due = sender->base < sender->next
+                            ? now + sender->timeout_ms
+                            : -1;
+}
+
+static void sender_emit_new(struct sender_state *sender,
+                            struct protocol_actions *actions)
+{
+    while (sender->sent_through < sender->next &&
+           actions->outgoing_count < PROTOCOL_MAX_WINDOW) {
+        actions->outgoing[actions->outgoing_count++] =
+            sender->outstanding[sender->sent_through % sender->window_size];
+        ++sender->sent_through;
+    }
+}
+
+static void sender_maybe_queue_fin(struct sender_state *sender)
+{
+    if (sender->input_finished && !sender->fin_sent &&
+        sender->base == sender->next) {
+        struct packet *fin =
+            &sender->outstanding[sender->next % sender->window_size];
+        fin->type = PACKET_FIN;
+        fin->seq = sender->next;
+        fin->length = 0;
+        ++sender->next;
+        sender->fin_sent = 1;
+    }
+}
+
+void protocol_actions_reset(struct protocol_actions *actions)
+{
+    if (actions != NULL) {
+        actions->outgoing_count = 0;
+        actions->delivered_length = 0;
+        actions->delivered_packet = 0;
+        actions->timer_due = -1;
+    }
+}
+
+void sender_init(struct sender_state *sender, uint32_t window_size,
+                 int64_t timeout_ms)
+{
+    memset(sender, 0, sizeof(*sender));
+    sender->window_size = window_size;
+    sender->timeout_ms = timeout_ms;
+    sender->timer_due = -1;
+}
+
+size_t sender_capacity(const struct sender_state *sender)
+{
+    return sender->window_size - (sender->next - sender->base);
+}
+
+int sender_push_data(struct sender_state *sender, const uint8_t *data,
+                     uint16_t length, int64_t now,
+                     struct protocol_actions *actions)
+{
+    struct packet *packet;
+
+    if (sender == NULL || data == NULL || actions == NULL || length == 0 ||
+        length > PACKET_MAX_PAYLOAD || sender->input_finished ||
+        sender_capacity(sender) == 0) {
+        return -1;
+    }
+    protocol_actions_reset(actions);
+    packet = &sender->outstanding[sender->next % sender->window_size];
+    packet->type = PACKET_DATA;
+    packet->seq = sender->next;
+    packet->length = length;
+    memcpy(packet->payload, data, length);
+    ++sender->next;
+    if (sender->timer_due < 0) {
+        sender_update_timer(sender, now);
+    }
+    sender_emit_new(sender, actions);
+    actions->timer_due = sender->timer_due;
+    return 0;
+}
+
+int sender_finish(struct sender_state *sender, int64_t now,
+                  struct protocol_actions *actions)
+{
+    if (sender == NULL || actions == NULL || sender->input_finished) {
+        return -1;
+    }
+    protocol_actions_reset(actions);
+    sender->input_finished = 1;
+    sender_maybe_queue_fin(sender);
+    if (sender->timer_due < 0 && sender->base < sender->next) {
+        sender_update_timer(sender, now);
+    }
+    sender_emit_new(sender, actions);
+    actions->timer_due = sender->timer_due;
+    return 0;
+}
+
+void sender_on_ack(struct sender_state *sender, uint32_t sequence,
+                   int64_t now, struct protocol_actions *actions)
+{
+    if (sender == NULL || actions == NULL) {
+        return;
+    }
+    protocol_actions_reset(actions);
+    if (sequence > sender->base && sequence <= sender->next) {
+        sender->base = sequence;
+        sender->consecutive_timeouts = 0;
+        sender_maybe_queue_fin(sender);
+        if (sender->base == sender->next) {
+            sender->complete = sender->fin_sent;
+            sender->timer_due = -1;
+        } else {
+            sender_update_timer(sender, now);
+        }
+    }
+    sender_emit_new(sender, actions);
+    actions->timer_due = sender->timer_due;
+}
+
+int sender_on_timeout(struct sender_state *sender, int64_t now,
+                      struct protocol_actions *actions)
+{
+    uint32_t sequence;
+
+    if (sender == NULL || actions == NULL) {
+        return -1;
+    }
+    protocol_actions_reset(actions);
+    if (sender->base == sender->next) {
+        actions->timer_due = -1;
+        return 0;
+    }
+    ++sender->consecutive_timeouts;
+    if (sender->consecutive_timeouts >= 10) {
+        actions->timer_due = sender->timer_due;
+        return 1;
+    }
+    for (sequence = sender->base; sequence < sender->next; ++sequence) {
+        actions->outgoing[actions->outgoing_count++] =
+            sender->outstanding[sequence % sender->window_size];
+    }
+    sender->sent_through = sender->next;
+    sender_update_timer(sender, now);
+    actions->timer_due = sender->timer_due;
+    return 0;
+}
+
+int sender_is_complete(const struct sender_state *sender)
+{
+    return sender != NULL && sender->complete;
+}
+
+void receiver_init(struct receiver_state *receiver)
+{
+    memset(receiver, 0, sizeof(*receiver));
+    receiver->linger_until = -1;
+}
+
+void receiver_on_packet(struct receiver_state *receiver,
+                        const struct packet *packet, int64_t now,
+                        struct protocol_actions *actions)
+{
+    struct packet ack;
+
+    if (receiver == NULL || packet == NULL || actions == NULL) {
+        return;
+    }
+    protocol_actions_reset(actions);
+    if (packet->type == PACKET_DATA && !receiver->finished &&
+        packet->seq == receiver->expected) {
+        memcpy(actions->delivered, packet->payload, packet->length);
+        actions->delivered_length = packet->length;
+        actions->delivered_packet = 1;
+        ++receiver->expected;
+    } else if (packet->type != PACKET_DATA && packet->type != PACKET_FIN) {
+        return;
+    } else if (packet->type == PACKET_FIN && !receiver->finished &&
+               packet->seq == receiver->expected) {
+        ++receiver->expected;
+        receiver->finished = 1;
+        receiver->linger_until = now + 2000;
+    } else if (receiver->finished &&
+               packet->type == PACKET_FIN &&
+               packet->seq + 1U == receiver->expected) {
+        /* A repeated FIN receives the same final cumulative ACK. */
+    }
+    ack.type = PACKET_ACK;
+    ack.seq = receiver->expected;
+    ack.length = 0;
+    actions->outgoing[0] = ack;
+    actions->outgoing_count = 1;
+    actions->timer_due = receiver->finished ? receiver->linger_until : -1;
+}
+
+int receiver_is_finished(const struct receiver_state *receiver)
+{
+    return receiver != NULL && receiver->finished;
+}
+
+int receiver_linger_expired(const struct receiver_state *receiver,
+                            int64_t now)
+{
+    return receiver != NULL && receiver->finished &&
+           now >= receiver->linger_until;
+}
+
 uint16_t packet_checksum(const uint8_t *data, size_t length)
 {
     uint32_t sum = 0;
