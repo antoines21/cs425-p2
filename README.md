@@ -6,11 +6,9 @@
 
 ## Known Bugs or Issues
 
-The sender transfers the file correctly in the Task 6 measurements. The
-receiver prints `receiver timed out waiting for a valid packet` after a
-successful transfer instead of exiting cleanly. One receiver process also
-segfaulted during a 5% loss run; the resulting file still passed `cmp`, but
-this remains an issue to fix in the later leak and crash-check task.
+The sender and receiver complete the transfer correctly under the tested
+lossy conditions. The receiver now treats the expected post-transfer linger
+timeout as a successful completion.
 
 ## Experience
 

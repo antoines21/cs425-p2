@@ -347,8 +347,17 @@ static int receive_file(int socket_fd, const char *file_name)
             break;
         }
         ready = wait_for_socket(socket_fd, timeout_ms);
-        if (ready <= 0) {
-            fprintf(stderr, "receiver timed out waiting for a valid packet\n");
+        if (ready < 0) {
+            fprintf(stderr, "receiver failed while waiting: %s\n",
+                    strerror(errno));
+            break;
+        }
+        if (ready == 0) {
+            if (receiver_is_finished(&receiver)) {
+                result = 0;
+            } else {
+                fprintf(stderr, "receiver timed out waiting for a valid packet\n");
+            }
             break;
         }
         received = recv(socket_fd, wire, sizeof(wire), 0);
