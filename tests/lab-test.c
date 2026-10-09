@@ -191,6 +191,119 @@ static void test_receiver_duplicate_gap_and_fin(void)
     TEST_ASSERT_EQUAL_UINT32(2u, receiver.expected);
 }
 
+static void test_edge_cases_and_invalid_inputs(void)
+{
+    struct sender_state sender;
+    struct receiver_state receiver;
+    struct protocol_actions actions;
+    struct packet packet = {.type = PACKET_DATA, .seq = 7, .length = 1};
+    struct packet decoded;
+    uint8_t buffer[PACKET_HEADER_SIZE + PACKET_MAX_PAYLOAD];
+    uint8_t data = 0x55;
+    size_t encoded_length = 0;
+
+    protocol_actions_reset(NULL);
+    protocol_actions_reset(&actions);
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)actions.outgoing_count);
+    TEST_ASSERT_EQUAL_INT(-1, sender_push_data(NULL, &data, 1, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_push_data(&sender, NULL, 1, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_push_data(&sender, &data, 0, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_push_data(&sender, &data,
+                                               PACKET_MAX_PAYLOAD + 1u, 0,
+                                               &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_push_data(&sender, &data, 1, 0, NULL));
+    sender_init(&sender, 1, 10);
+    TEST_ASSERT_EQUAL_INT(0, sender_finish(&sender, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_push_data(&sender, &data, 1, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_finish(&sender, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_finish(NULL, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_finish(&sender, 0, NULL));
+    TEST_ASSERT_EQUAL_INT(0, sender_on_timeout(&sender, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_on_timeout(NULL, 0, &actions));
+    TEST_ASSERT_EQUAL_INT(-1, sender_on_timeout(&sender, 0, NULL));
+    sender_init(&sender, 1, 10);
+    TEST_ASSERT_EQUAL_INT(0, sender_on_timeout(&sender, 0, &actions));
+    sender_init(&sender, PROTOCOL_MAX_WINDOW, 10);
+    sender.next = PROTOCOL_MAX_WINDOW + 1u;
+    sender_on_ack(&sender, 0, 0, &actions);
+    sender_on_ack(&sender, PROTOCOL_MAX_WINDOW + 2u, 0, &actions);
+    sender_on_ack(NULL, 1, 0, &actions);
+    sender_on_ack(&sender, 1, 0, NULL);
+    TEST_ASSERT_FALSE(sender_is_complete(NULL));
+
+    receiver_init(&receiver);
+    receiver_on_packet(NULL, &packet, 0, &actions);
+    receiver_on_packet(&receiver, NULL, 0, &actions);
+    receiver_on_packet(&receiver, &packet, 0, NULL);
+    packet.type = PACKET_ACK;
+    receiver_on_packet(&receiver, &packet, 0, &actions);
+    TEST_ASSERT_EQUAL_UINT32(0u, (uint32_t)actions.outgoing[0].seq);
+    packet.type = PACKET_FIN;
+    packet.seq = 9;
+    receiver_on_packet(&receiver, &packet, 0, &actions);
+    packet.type = PACKET_DATA;
+    packet.seq = 0;
+    receiver_on_packet(&receiver, &packet, 0, &actions);
+    TEST_ASSERT_FALSE(receiver_linger_expired(&receiver, 0));
+    receiver.finished = 1;
+    receiver.expected = 10;
+    receiver_on_packet(&receiver, &packet, 0, &actions);
+    receiver.linger_until = 100;
+    TEST_ASSERT_FALSE(receiver_is_finished(NULL));
+    TEST_ASSERT_FALSE(receiver_linger_expired(NULL, 0));
+    TEST_ASSERT_FALSE(receiver_linger_expired(&receiver, 0));
+
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(NULL, buffer, sizeof(buffer),
+                                            &encoded_length));
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(&packet, NULL, sizeof(buffer),
+                                            &encoded_length));
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(&packet, buffer, sizeof(buffer),
+                                            NULL));
+    packet.type = 3;
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(&packet, buffer, sizeof(buffer),
+                                            &encoded_length));
+    packet.type = PACKET_DATA;
+    packet.length = PACKET_MAX_PAYLOAD + 1u;
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(&packet, buffer, sizeof(buffer),
+                                            &encoded_length));
+    packet.type = PACKET_ACK;
+    packet.length = 1;
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(&packet, buffer, sizeof(buffer),
+                                            &encoded_length));
+    packet.length = 0;
+    TEST_ASSERT_EQUAL_INT(-1, packet_encode(&packet, buffer, PACKET_HEADER_SIZE - 1,
+                                            &encoded_length));
+    TEST_ASSERT_EQUAL_INT(0, packet_encode(&packet, buffer, sizeof(buffer),
+                                           &encoded_length));
+
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(NULL, encoded_length, &decoded));
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, encoded_length, NULL));
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, PACKET_HEADER_SIZE - 1,
+                                            &decoded));
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, sizeof(buffer) + 1,
+                                            &decoded));
+    buffer[0] = 3;
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, encoded_length, &decoded));
+    buffer[0] = PACKET_ACK;
+    buffer[1] = 1;
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, encoded_length, &decoded));
+
+    memset(buffer, 0, sizeof(buffer));
+    buffer[0] = PACKET_ACK;
+    buffer[8] = 0x04;
+    buffer[9] = 0x01;
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, PACKET_HEADER_SIZE + 1,
+                                            &decoded));
+    buffer[8] = 0x04;
+    buffer[9] = 0x01;
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, sizeof(buffer), &decoded));
+    memset(buffer, 0, sizeof(buffer));
+    buffer[0] = PACKET_ACK;
+    buffer[9] = 1;
+    TEST_ASSERT_EQUAL_INT(-1, packet_decode(buffer, PACKET_HEADER_SIZE + 1,
+                                            &decoded));
+}
+
 static int deliver_with_loss_and_damage(const struct packet *packet,
                                        struct packet *queue,
                                        size_t *queue_count,
@@ -351,6 +464,7 @@ int main(void)
     RUN_TEST(test_sender_window_and_ack_progression);
     RUN_TEST(test_sender_timeout_and_give_up);
     RUN_TEST(test_receiver_duplicate_gap_and_fin);
+    RUN_TEST(test_edge_cases_and_invalid_inputs);
     RUN_TEST(test_end_to_end_seeded_lossy_channel);
     return UNITY_END();
 }

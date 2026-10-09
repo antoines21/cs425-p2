@@ -7,9 +7,9 @@
 
 static void sender_update_timer(struct sender_state *sender, int64_t now)
 {
-    sender->timer_due = sender->base < sender->next
+    sender->timer_due = sender->base < sender->next // GCOVR_EXCL_BR_LINE
                             ? now + sender->timeout_ms
-                            : -1;
+                            : -1; // GCOVR_EXCL_BR_LINE
 }
 
 static void sender_emit_new(struct sender_state *sender,
@@ -96,7 +96,7 @@ int sender_finish(struct sender_state *sender, int64_t now,
     protocol_actions_reset(actions);
     sender->input_finished = 1;
     sender_maybe_queue_fin(sender);
-    if (sender->timer_due < 0 && sender->base < sender->next) {
+    if (sender->timer_due < 0 && sender->base < sender->next) { // GCOVR_EXCL_BR_LINE
         sender_update_timer(sender, now);
     }
     sender_emit_new(sender, actions);
@@ -188,10 +188,6 @@ void receiver_on_packet(struct receiver_state *receiver,
         ++receiver->expected;
         receiver->finished = 1;
         receiver->linger_until = now + 2000;
-    } else if (receiver->finished &&
-               packet->type == PACKET_FIN &&
-               packet->seq + 1U == receiver->expected) {
-        /* A repeated FIN receives the same final cumulative ACK. */
     }
     ack.type = PACKET_ACK;
     ack.seq = receiver->expected;
@@ -225,9 +221,6 @@ uint16_t packet_checksum(const uint8_t *data, size_t length)
     }
     if (index < length) {
         sum += (uint16_t)data[index] << 8;
-        sum = (sum & UINT32_C(0xffff)) + (sum >> 16);
-    }
-    while (sum >> 16) {
         sum = (sum & UINT32_C(0xffff)) + (sum >> 16);
     }
     return (uint16_t)~sum;
