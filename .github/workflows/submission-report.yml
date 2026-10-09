@@ -34,9 +34,10 @@ jobs:
             echo "- The repository visibility is internal." >> submission-report.md
         fi
         echo "- The workflow was triggered by ${{ github.actor }}" >> submission-report.md
-    - uses: docker://pandoc/core:3.5
-      with:
-        args: -s -o submission-report.docx submission-report.md
+    - name: Install pandoc
+      run: sudo apt-get update && sudo apt-get install -y pandoc
+    - name: Convert report to DOCX
+      run: pandoc -s -o submission-report.docx submission-report.md
 
     - uses: stefanzweifel/git-auto-commit-action@v6
       with:
