@@ -1,23 +1,64 @@
-# Project X
+# Project 2 - Reliable Data Transfer
 
-- Name: John Doe
-- Email: johndoe@u.boisestate.edu
-- Class: CS123-001
+- Name: Antoine Sabatier
+- Email: antoinesabatier@u.boisestate.edu
+- Class: CS425-001
 
 ## Known Bugs or Issues
 
-The sender and receiver complete the transfer correctly under the tested
-lossy conditions. The receiver now treats the expected post-transfer linger
-timeout as a successful completion.
+No known bugs remain after the coverage, leak, crash, and lossy-transfer
+checks. The receiver treats the expected post-transfer linger timeout as a
+successful completion.
 
 ## Experience
 
-TODO: Describe your experience with the project (struggles, breakthroughs, etc.).
+The most challenging part of the project was making Go-Back-N reliable while
+also keeping the sender responsive to both acknowledgements and timer
+expiration. Cumulative acknowledgements simplified normal progress, but
+duplicate acknowledgements, gaps, retransmissions, and the FIN packet required
+careful state transitions. The fixed-seed in-memory lossy-channel test was
+particularly useful because it reproduced loss, corruption, and duplication
+without depending on network timing.
 
-## Analysis
+The window measurements made the protocol behavior concrete. With a 100 ms
+round trip, a window of one spends nearly all of its time waiting for the next
+acknowledgement. A larger window keeps packets in flight and approaches the
+ideal bandwidth-delay-product improvement. The leak and crash checks also
+helped identify that a receiver completing its linger period should return
+success rather than report a timeout failure.
 
-The measurements and interpretation for Task 6 are included in the Results
-section below.
+## Design
+
+The implementation is divided into three layers so that protocol behavior can
+be tested independently from operating-system and network behavior.
+
+1. **Packets.** The packet layer contains the checksum, encoding, and decoding
+   functions. These functions accept byte buffers or packet structures and
+   validate packet type, payload length, size, and checksum. They do not use
+   sockets, clocks, or files, so malformed and corrupted datagrams can be
+   tested deterministically.
+2. **Go-Back-N state machines.** The sender and receiver state are represented
+   by structs and manipulated through event-oriented functions. The sender
+   tracks `base`, `next`, the outstanding retransmission window, cumulative
+   acknowledgements, FIN state, and one retransmission timer. The receiver
+   tracks the next expected sequence number, delivers only the next
+   in-order DATA packet, acknowledges duplicates or packets beyond a gap with
+   the current cumulative acknowledgement, and enters a short FIN linger
+   period. The current time is passed into these functions rather than read
+   internally, and each call reports packets to send, payload to deliver, and
+   the next timer deadline.
+3. **I/O.** The application layer owns the UDP socket, relay registration,
+   `poll`, the monotonic clock, and file I/O. It reads a datagram or timer
+   event, passes it to the appropriate state machine, then sends the returned
+   packets or writes the returned payload. This layer is intentionally thin
+   and is the only layer that depends on the operating system.
+
+This separation makes the important protocol logic deterministic and
+testable. Unit tests use supplied timestamps and an in-memory channel, so a
+lost packet is simply omitted, a corrupted packet is rejected by the packet
+layer, and a timeout is represented by advancing the test timestamp. The
+production program uses the same state machines with real sockets and a real
+monotonic clock.
 
 ## Results
 
@@ -55,3 +96,18 @@ be discarded by the receiver, so a single loss can force a larger burst of
 retransmissions and additional round trips. This increased the measured time
 from 6.575 s to 22.482 s for window 16, while window 1 increased from
 103.342 s to 130.421 s.
+
+## Testing
+
+The project was validated with:
+
+```bash
+make check
+make report
+make leak
+make leak-test
+```
+
+The test suite passes all seven tests, and `make report` reports 100% line
+coverage for `src/lab.c` (191 of 191 lines). The Task 6 transfers also
+produced byte-identical copies for all 12 runs.
